@@ -326,4 +326,4 @@ async function getStreams(id) {
   return streams;
 }
 
-module.exports = { PREFIX, MAIN_URL, getCatalog, search, getMeta, getStreams };
+module.exports = { PREFIX, MAIN_URL, getCatalog, search, getMeta, getStreams, getChannels, toId };

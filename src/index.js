@@ -35,7 +35,7 @@ process.on('uncaughtException', (err) => {
 
 const builder = new addonBuilder(manifest);
 
-const HANDLER_TIMEOUT_MS = parseInt(process.env.STREAM_HANDLER_TIMEOUT_MS || '25000', 10);
+const HANDLER_TIMEOUT_MS = parseInt(process.env.STREAM_HANDLER_TIMEOUT_MS || '42000', 10);
 function withTimeout(promise, ms) {
   let timer;
   const timeout = new Promise((resolve) => {

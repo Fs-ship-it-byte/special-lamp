@@ -158,57 +158,70 @@ function safeContinue(req) {
   }
 }
 
-// Página "cascarón" (EXPERIMENTAL, apagada por defecto): responde un HTML
-// vacío en vez de la página real del canal. NO sirve en canales como ESPN:
-// la página real trae un script inline con un token (window['ZpQw9X...'])
-// que el iframe core.php -- mismo origen -- lee desde window.parent para
-// generar su firma. Sin ese token no sale ningún playlist.php. Se deja
-// disponible con LIBREFUTBOL_STUB_PARENT=1 por si algún día sirve.
-const STUB_PARENT = process.env.LIBREFUTBOL_STUB_PARENT === '1';
-const SETTLE_MS = parseInt(process.env.LIBREFUTBOL_SETTLE_MS || '5000', 10);
-const STUB_HTML = '<!doctype html><html><head><meta charset="utf-8"></head><body></body></html>';
+// ==========================================
+// RESOLUCIÓN POR CANAL -- UNA PÁGINA NUEVA POR SERVIDOR
+// ==========================================
+// Lo que se aprendió con los logs reales:
+//  1) El sitio sirve HTML DISTINTO según el cliente. A Chromium le da
+//     botones <button class="option" data-src=".../live2/core.php?canal=..">;
+//     al fetch plano le puede dar enlaces a otras rutas (/envivo2/...) que no
+//     resuelven nada. Por eso la LISTA DE SERVIDORES se lee del DOM que ve
+//     Chromium, no del HTML estático.
+//  2) La página del canal trae un token inline (window['ZpQw9X...']) que el
+//     iframe core.php (mismo origen) lee del padre para firmar. Una página
+//     "cascarón" sin ese token no resuelve nada, y reusar la MISMA página
+//     para un segundo servidor tampoco (parece de un solo uso). Por eso cada
+//     servidor se resuelve en una página nueva.
+//  3) Varios iframes a la vez en una página dieron 0/3 siempre.
+// Las páginas respetan el límite de concurrencia (PUPPETEER_MAX_CONCURRENT_PAGES,
+// default 1 = de a una). Con más RAM, subirlo resuelve los servidores en
+// paralelo (cada uno en su propia página).
+// ==========================================
 
-function normHref(u) {
+function samePath(a, b) {
   try {
-    return new URL(u).href;
+    const x = new URL(a);
+    const y = new URL(b);
+    return x.pathname === y.pathname && x.search === y.search;
   } catch (e) {
-    return u || '';
+    return false;
   }
 }
-function canalOf(u) {
-  try {
-    return new URL(u).searchParams.get('canal');
-  } catch (e) {
-    return null;
+
+// ¿El pedido a playlist.php salió del iframe del servidor que estamos
+// probando? (una página puede traer su propio iframe autocargado con otro
+// servidor; ese no debe contarse). Si ningún frame de la cadena es un
+// core.php, se acepta (no hay forma de distinguir).
+function requestFromTarget(req, targetUrl) {
+  let sawCore = false;
+  for (let f = req.frame(); f; f = f.parentFrame()) {
+    const u = f.url();
+    if (!u || !/core\.php/i.test(u)) continue;
+    sawCore = true;
+    if (samePath(u, targetUrl)) return true;
   }
+  return !sawCore;
 }
 
 /**
- * Resuelve el playlist.php de VARIOS servidores de un mismo canal con UNA
- * sola página de Chromium:
- *   1) Fase paralela: un iframe por servidor, todos a la vez (cada
- *      playlist.php capturado se atribuye al servidor según de qué iframe
- *      salió el pedido). Tarda lo que tarda el más lento, no la suma.
- *   2) Fase secuencial: los que no se resolvieron en paralelo se reintentan
- *      de a uno, por si el sitio no tolera varios a la vez.
- * Devuelve [{ candidate, url, headers }] (puede ser parcial o vacío).
+ * Abre UNA página nueva del canal (la real, con su token) y:
+ *  - sin `target`: lee la lista de servidores del DOM y resuelve el primero;
+ *  - con `target`: resuelve ese servidor.
+ * Devuelve { candidates, result, skipped }.
  */
-async function resolvePlaylistsViaBrowser(
-  channelUrl,
-  candidates,
-  { deadline, perCandidateMs = 10000, parallelMs = 12000 } = {}
-) {
-  const results = [];
+async function runChannelPage(channelUrl, { target = null, fallback = [], deadline, perCandidateMs = 12000 }) {
+  const out = { candidates: null, result: null, skipped: false };
   if (!puppeteer) {
     console.log('[librefutbol/browser] puppeteer no está disponible (no instalado o falló el require)');
-    return results;
+    out.skipped = true;
+    return out;
   }
-  if (!deadline) deadline = Date.now() + 30000;
 
-  const gotSlot = await acquirePageSlot(Math.max(0, deadline - Date.now() - 5000));
+  const gotSlot = await acquirePageSlot(Math.max(0, deadline - Date.now() - 4000));
   if (!gotSlot) {
-    console.log('[librefutbol/browser] sin cupo de página a tiempo (cola llena), se abandona este pedido');
-    return results;
+    console.log('[librefutbol/browser] sin cupo de página a tiempo (cola llena)');
+    out.skipped = true;
+    return out;
   }
 
   let page = null;
@@ -219,197 +232,140 @@ async function resolvePlaylistsViaBrowser(
     await page.setUserAgent(UA);
     await page.setRequestInterception(true);
 
-    const state = { stub: false, stubbed: false, active: [], seen: new Set(), warnedUnattributed: false };
-
-    function pickEntry(req) {
-      const act = state.active.filter((e) => !e.result);
-      if (act.length === 0) return null;
-      if (act.length === 1) return act[0];
-      for (let f = req.frame(); f; f = f.parentFrame()) {
-        const fu = f.url();
-        if (!fu) continue;
-        const nu = normHref(fu);
-        const fc = canalOf(fu);
-        const hit = act.find((e) => e.key === nu || (e.canal && fc && e.canal === fc));
-        if (hit) return hit;
-      }
-      return null;
-    }
+    let current = target; // servidor que se está probando ahora
+    let captured = null;
 
     page.on('request', (req) => {
       const url = req.url();
       const type = req.resourceType();
-
-      if (state.stub && !state.stubbed && type === 'document' && req.frame() === page.mainFrame()) {
-        state.stubbed = true;
-        try {
-          req
-            .respond({ status: 200, contentType: 'text/html; charset=utf-8', body: STUB_HTML })
-            .catch(() => {});
-        } catch (e) {
-          /* noop */
-        }
-        return;
-      }
-
       if (type === 'image' || type === 'font' || type === 'media') return safeAbort(req);
       if (AD_NOISE.some((needle) => url.includes(needle))) return safeAbort(req);
 
-      if (/playlist\.php/i.test(url) && !state.seen.has(url)) {
-        const entry = pickEntry(req);
-        if (entry) {
-          const referer = req.headers()['referer'] || entry.candidate.url;
-          let origin;
-          try {
-            origin = new URL(referer).origin;
-          } catch (e) {
-            origin = undefined;
-          }
-          state.seen.add(url);
-          entry.result = { url, headers: { Referer: referer, Origin: origin, 'User-Agent': UA } };
-          entry.at = Date.now();
-        } else if (!state.warnedUnattributed && state.active.length > 0) {
-          state.warnedUnattributed = true;
-          console.log('[librefutbol/browser] playlist.php visto pero no se pudo atribuir a un servidor');
+      if (current && !captured && /playlist\.php/i.test(url) && requestFromTarget(req, current.url)) {
+        const referer = req.headers()['referer'] || current.url;
+        let origin;
+        try {
+          origin = new URL(referer).origin;
+        } catch (e) {
+          origin = undefined;
         }
+        captured = { url, headers: { Referer: referer, Origin: origin, 'User-Agent': UA } };
       }
       safeContinue(req);
     });
 
-    const setSrc = (idx, src) =>
-      page
-        .evaluate(
-          (i, u) => {
-            const f = document.getElementById('srvFrame' + i);
-            if (f) f.src = u;
-          },
-          idx,
-          src
-        )
-        .catch(() => {});
-
-    // Espera a que todos resuelvan, hasta limitMs. Si ya resolvió al menos
-    // uno, solo espera settleMs más por los demás (no vale la pena frenar
-    // todo el pedido por un servidor lento).
-    const waitFor = async (entries, limitMs, settleMs = 0) => {
-      const t0 = Date.now();
-      while (entries.some((e) => !e.result) && Date.now() - t0 < limitMs && !page.isClosed()) {
-        if (settleMs > 0) {
-          const firstAt = Math.min(...entries.filter((e) => e.result).map((e) => e.at), Infinity);
-          if (firstAt !== Infinity && Date.now() - firstAt >= settleMs) break;
-        }
-        await sleep(120);
-      }
-    };
-
-    const withCookies = async (entry) => {
-      try {
-        const cdnOrigin = new URL(entry.result.url).origin;
-        const cookies = await page.cookies(cdnOrigin, channelUrl);
-        if (cookies.length > 0) {
-          entry.result.headers.Cookie = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
-        }
-      } catch (e) {
-        /* sin cookies extra, seguimos igual */
-      }
-    };
-
-    const modes = STUB_PARENT ? ['stub', 'real'] : ['real'];
-    let pending = candidates.slice();
-
-    for (const mode of modes) {
-      if (pending.length === 0 || page.isClosed()) break;
-      if (deadline - Date.now() < 4000) {
-        console.log('[librefutbol/browser] se acabó el presupuesto de tiempo antes de intentar');
-        break;
-      }
-
-      state.stub = mode === 'stub';
-      state.stubbed = false;
-      const tMode = Date.now();
-      const navTimeout = Math.min(15000, Math.max(3000, deadline - Date.now() - 3000));
-      try {
-        await page.goto(channelUrl, { waitUntil: 'domcontentloaded', timeout: navTimeout });
-      } catch (e) {
-        console.log(`[librefutbol/browser] goto (${mode}) lento/falló (${e.message}), sigo igual`);
-      }
-      console.log(`[librefutbol/browser] página (${mode}) lista en ${Date.now() - tMode}ms`);
-
-      // Un iframe por servidor. Si la página real trae su iframe de player,
-      // se clona (mismos atributos: allow, sandbox, etc.).
-      try {
-        await page.evaluate((n) => {
-          const orig = document.querySelector('iframe#playerFrame, iframe#player-frame, iframe[name="player"]');
-          const parent = (orig && orig.parentNode) || document.body;
-          for (let i = 0; i < n; i++) {
-            const f = orig ? orig.cloneNode(false) : document.createElement('iframe');
-            f.removeAttribute('src');
-            f.id = 'srvFrame' + i;
-            f.name = 'srv' + i;
-            if (!orig) f.style.cssText = 'width:640px;height:360px;border:0';
-            parent.appendChild(f);
-          }
-        }, candidates.length);
-      } catch (e) {
-        console.log(`[librefutbol/browser] no se pudieron crear los iframes (${mode}): ${e.message}`);
-        continue;
-      }
-
-      const entries = pending.map((c) => ({
-        candidate: c,
-        idx: candidates.indexOf(c),
-        key: normHref(c.url),
-        canal: canalOf(c.url),
-        result: null,
-        at: 0,
-      }));
-
-      // ---- Fase paralela ----
-      if (entries.length > 1) {
-        const tPar = Date.now();
-        state.active = entries;
-        await Promise.all(entries.map((e) => setSrc(e.idx, e.candidate.url)));
-        await waitFor(entries, Math.min(parallelMs, deadline - Date.now() - 2500), SETTLE_MS);
-        state.active = [];
-        console.log(
-          `[librefutbol/browser] paralelo (${mode}): ${entries.filter((e) => e.result).length}/${entries.length} en ${Date.now() - tPar}ms`
-        );
-        await Promise.all(entries.map((e) => setSrc(e.idx, 'about:blank')));
-      }
-
-      // ---- Fase secuencial para los que faltan ----
-      for (const e of entries) {
-        if (e.result || page.isClosed()) continue;
-        const remaining = deadline - Date.now();
-        if (remaining < 2500) {
-          console.log('[librefutbol/browser] se acabó el presupuesto de tiempo, no se prueban más servidores');
-          break;
-        }
-        const t0 = Date.now();
-        state.active = [e];
-        await setSrc(e.idx, e.candidate.url);
-        await waitFor([e], Math.min(perCandidateMs, remaining));
-        state.active = [];
-        await setSrc(e.idx, 'about:blank');
-        if (e.result) {
-          console.log(`[librefutbol/browser] ${e.candidate.name}: capturado en ${Date.now() - t0}ms (secuencial)`);
-        } else {
-          console.log(`[librefutbol/browser] ${e.candidate.name}: sin playlist.php en ${Date.now() - t0}ms`);
-        }
-      }
-
-      for (const e of entries) {
-        if (!e.result) continue;
-        await withCookies(e);
-        results.push({ candidate: e.candidate, url: e.result.url, headers: e.result.headers });
-      }
-      pending = pending.filter((c) => !results.some((r) => r.candidate === c));
-
-      if (results.length > 0) break; // con algo resuelto no se repite en modo "real"
-      console.log(`[librefutbol/browser] modo ${mode}: 0 servidores resueltos`);
+    const t0 = Date.now();
+    const navTimeout = Math.min(15000, Math.max(3000, deadline - Date.now() - 3000));
+    try {
+      await page.goto(channelUrl, { waitUntil: 'domcontentloaded', timeout: navTimeout });
+    } catch (e) {
+      console.log(`[librefutbol/browser] goto lento/falló (${e.message}), sigo igual`);
     }
+    const tLoad = Date.now() - t0;
+
+    // --- Descubrir servidores desde el DOM (solo en la primera página) ---
+    if (!target) {
+      try {
+        await page.waitForFunction(
+          () => document.querySelector('button.option[data-src], [data-src*="core.php"], a[href*="core.php"]'),
+          { timeout: Math.max(1000, Math.min(6000, deadline - Date.now() - 1000)) }
+        );
+      } catch (e) {
+        /* leemos lo que haya */
+      }
+      const found = await page
+        .evaluate(() => {
+          const list = [];
+          const seen = new Set();
+          const add = (raw, label) => {
+            if (!raw || !/core\.php/i.test(raw)) return;
+            let abs;
+            try {
+              abs = new URL(raw, location.href).href;
+            } catch (e) {
+              return;
+            }
+            if (seen.has(abs)) return;
+            seen.add(abs);
+            list.push({ url: abs, name: (label || '').replace(/\s+/g, ' ').trim() });
+          };
+          document
+            .querySelectorAll('button.option[data-src], .options-left [data-src]')
+            .forEach((el) => add(el.getAttribute('data-src'), el.textContent || el.getAttribute('data-label')));
+          if (list.length === 0) {
+            document
+              .querySelectorAll('a.option[href], .options-left a[href], a[target="player"][href]')
+              .forEach((el) => add(el.getAttribute('href'), el.textContent));
+          }
+          if (list.length === 0) {
+            document.querySelectorAll('[data-src],[data-url],[data-link]').forEach((el) =>
+              add(el.getAttribute('data-src') || el.getAttribute('data-url') || el.getAttribute('data-link'), el.textContent)
+            );
+          }
+          if (list.length === 0) {
+            document.querySelectorAll('iframe[src*="core.php"]').forEach((f) => add(f.getAttribute('src'), 'Opción 1'));
+          }
+          return list;
+        })
+        .catch(() => []);
+
+      out.candidates = (found.length > 0 ? found : fallback).map((c, i) => ({
+        url: c.url,
+        name: c.name || `Servidor ${i + 1}`,
+      }));
+      console.log(
+        `[librefutbol/browser] página lista en ${tLoad}ms, servidores en el DOM: ${found.length}` +
+          (found.length === 0 ? ` (uso ${fallback.length} del HTML estático)` : '')
+      );
+      current = out.candidates[0] || null;
+      if (!current) return out;
+    } else {
+      console.log(`[librefutbol/browser] página lista en ${tLoad}ms para "${target.name}"`);
+    }
+
+    // --- Apuntar el iframe del player al servidor elegido ---
+    try {
+      await page.evaluate((src) => {
+        let frame = document.querySelector('iframe#playerFrame, iframe#player-frame, iframe[name="player"]');
+        if (!frame) {
+          frame = document.createElement('iframe');
+          frame.id = 'playerFrame';
+          frame.style.cssText = 'width:640px;height:360px;border:0';
+          document.body.appendChild(frame);
+        }
+        frame.src = src;
+      }, current.url);
+    } catch (e) {
+      console.log(`[librefutbol/browser] no se pudo setear el iframe para ${current.name}: ${e.message}`);
+      return out;
+    }
+
+    const tWait = Date.now();
+    const limit = Math.min(perCandidateMs, Math.max(0, deadline - Date.now() - 1000));
+    while (!captured && Date.now() - tWait < limit && !page.isClosed()) {
+      await sleep(150);
+    }
+
+    if (!captured) {
+      console.log(`[librefutbol/browser] ${current.name}: sin playlist.php en ${Date.now() - tWait}ms`);
+      return out;
+    }
+    console.log(`[librefutbol/browser] ${current.name}: playlist.php capturado en ${Date.now() - tWait}ms`);
+
+    try {
+      const cdnOrigin = new URL(captured.url).origin;
+      const cookies = await page.cookies(cdnOrigin, channelUrl);
+      if (cookies.length > 0) {
+        captured.headers.Cookie = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
+      }
+    } catch (e) {
+      /* sin cookies extra, seguimos igual */
+    }
+    out.result = { candidate: current, url: captured.url, headers: captured.headers };
+    return out;
   } catch (e) {
-    console.log(`[librefutbol/browser] error resolviendo ${channelUrl}: ${e.message}`);
+    console.log(`[librefutbol/browser] error en ${channelUrl}: ${e.message}`);
+    return out;
   } finally {
     if (page) {
       try {
@@ -420,9 +376,41 @@ async function resolvePlaylistsViaBrowser(
     }
     releasePageSlot();
   }
-  // Mismo orden que los botones del sitio.
-  results.sort((x, y) => candidates.indexOf(x.candidate) - candidates.indexOf(y.candidate));
-  return results;
+}
+
+/**
+ * Resuelve todos los servidores de un canal. `fallback` = candidatos del
+ * HTML estático, solo se usan si el DOM de Chromium no trae ninguno.
+ * Devuelve { results: [{candidate,url,headers}], total }.
+ */
+async function resolveChannelViaBrowser(channelUrl, fallback, { deadline, perCandidateMs = 12000 } = {}) {
+  if (!deadline) deadline = Date.now() + 45000;
+
+  const first = await runChannelPage(channelUrl, { fallback, deadline, perCandidateMs });
+  const list = first.candidates && first.candidates.length > 0 ? first.candidates : fallback || [];
+  const results = [];
+  if (first.result) results.push(first.result);
+  if (first.skipped || list.length === 0) return { results, total: list.length };
+
+  // El resto de servidores: una página nueva cada uno (se encolan según el
+  // límite de concurrencia).
+  const rest = list.slice(1);
+  const settled = await Promise.all(
+    rest.map((cand) => runChannelPage(channelUrl, { target: cand, deadline, perCandidateMs }))
+  );
+  for (const r of settled) if (r.result) results.push(r.result);
+
+  // Un reintento secuencial para los que fallaron, si queda tiempo.
+  const missing = list.filter((c) => !results.some((r) => r.candidate.url === c.url));
+  for (const cand of missing) {
+    if (deadline - Date.now() < 12000) break;
+    console.log(`[librefutbol/browser] reintentando "${cand.name}"`);
+    const r = await runChannelPage(channelUrl, { target: cand, deadline, perCandidateMs });
+    if (r.result) results.push(r.result);
+  }
+
+  results.sort((x, y) => list.findIndex((c) => c.url === x.candidate.url) - list.findIndex((c) => c.url === y.candidate.url));
+  return { results, total: list.length };
 }
 
 /**
@@ -518,19 +506,8 @@ async function collectCandidatesViaBrowser(channelUrl, { deadline } = {}) {
   }
 }
 
-// Compatibilidad con la firma vieja (un solo candidato).
-async function resolvePlaylistViaBrowser(channelUrl, candidateEmbedUrl, timeoutMs = 25000) {
-  const r = await resolvePlaylistsViaBrowser(
-    channelUrl,
-    [{ url: candidateEmbedUrl, name: 'Servidor' }],
-    { deadline: Date.now() + timeoutMs + 5000, perCandidateMs: timeoutMs }
-  );
-  return r[0] ? { url: r[0].url, headers: r[0].headers } : null;
-}
-
 module.exports = {
-  resolvePlaylistsViaBrowser,
-  resolvePlaylistViaBrowser,
+  resolveChannelViaBrowser,
   collectCandidatesViaBrowser,
   warmBrowser,
   getBrowser,

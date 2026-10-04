@@ -327,21 +327,9 @@ async function getEmbedCandidates(channelUrl, { deadline } = {}) {
 
   let candidates = html ? extractCandidatesFromHtml(html) : [];
 
-  // Plan B: si el HTML estático no trae servidores (o ni cargó), se lee el
-  // DOM ya renderizado con Chromium.
-  if (candidates.length === 0) {
-    if (html) logNoCandidates(channelUrl, html);
-    console.log('[librefutbol] sin candidatos en el HTML estático, pruebo con el navegador');
-    try {
-      const { collectCandidatesViaBrowser } = require('../extractors/browser');
-      const viaBrowser = await collectCandidatesViaBrowser(channelUrl, { deadline });
-      candidates = viaBrowser.map((c, i) => ({ url: c.url, name: c.name || `Servidor ${i + 1}` }));
-    } catch (e) {
-      console.log(`[librefutbol] falló el plan B de candidatos: ${e.message}`);
-    }
-  }
+  if (candidates.length === 0 && html) logNoCandidates(channelUrl, html);
 
-  console.log(`[librefutbol] ${candidates.length} candidato(s) de embed para ${channelUrl}`);
+  console.log(`[librefutbol] ${candidates.length} candidato(s) en el HTML estático de ${channelUrl} (la lista real se lee del DOM de Chromium)`);
   return candidates;
 }
 
@@ -384,9 +372,8 @@ async function resolveEmbedToPlaylist(embedUrl, referer, depth = 0) {
 // ==========================================
 // Presupuesto total por pedido de streams. Se reparte entre cargar la
 // página y probar cada servidor; lo que no alcance se devuelve parcial.
-const STREAM_BUDGET_MS = parseInt(process.env.LIBREFUTBOL_BUDGET_MS || '45000', 10);
-const PARALLEL_MS = parseInt(process.env.LIBREFUTBOL_PARALLEL_MS || '12000', 10);
-const PER_CANDIDATE_MS = parseInt(process.env.LIBREFUTBOL_PER_SERVER_MS || '10000', 10);
+const STREAM_BUDGET_MS = parseInt(process.env.LIBREFUTBOL_BUDGET_MS || '55000', 10);
+const PER_CANDIDATE_MS = parseInt(process.env.LIBREFUTBOL_PER_SERVER_MS || '12000', 10);
 
 // Cache corto de streams ya resueltos + dedupe de pedidos en vuelo.
 // Stremio suele pedir los streams del mismo canal más de una vez seguidas
@@ -411,32 +398,25 @@ async function resolveStreams(id) {
   const t0 = Date.now();
   const deadline = t0 + STREAM_BUDGET_MS;
   const channelUrl = fromId(id);
-  const candidates = await getEmbedCandidatesCached(channelUrl, deadline);
 
-  if (candidates.length === 0) {
-    console.log(`[librefutbol] sin candidatos de embed para ${channelUrl}`);
-    return [];
+  // Candidatos del HTML estático: solo respaldo (puede ser una variante
+  // distinta a la que ve Chromium, ver extractors/browser.js).
+  let fallback = [];
+  try {
+    fallback = await getEmbedCandidatesCached(channelUrl, deadline);
+  } catch (e) {
+    console.log(`[librefutbol] candidatos estáticos fallaron: ${e.message}`);
   }
 
   const { buildProxyPlaylistUrl } = require('../hlsproxy');
-  const { resolvePlaylistsViaBrowser } = require('../extractors/browser');
+  const { resolveChannelViaBrowser } = require('../extractors/browser');
 
-  // Hasta 2 intentos: si el primero no devuelve NADA (Chromium recién
-  // caído, página que no cargó) y queda tiempo, se reintenta con página
-  // limpia. Si el primero devolvió algo, aunque sea parcial, no se repite.
-  let resolved = [];
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    if (deadline - Date.now() < 5000) break;
-    resolved = await resolvePlaylistsViaBrowser(channelUrl, candidates, {
-      deadline,
-      perCandidateMs: PER_CANDIDATE_MS,
-      parallelMs: PARALLEL_MS,
-    });
-    if (resolved.length > 0) break;
-    console.log(`[librefutbol] intento ${attempt}: 0 servidores resueltos${attempt < 2 ? ', reintento' : ''}`);
-  }
+  const { results, total } = await resolveChannelViaBrowser(channelUrl, fallback, {
+    deadline,
+    perCandidateMs: PER_CANDIDATE_MS,
+  });
 
-  const streams = resolved.map(({ candidate, url, headers }) => ({
+  const streams = results.map(({ candidate, url, headers }) => ({
     name: 'LibreFutbol',
     title: candidate.name,
     url: buildProxyPlaylistUrl(url, headers),
@@ -444,12 +424,10 @@ async function resolveStreams(id) {
     behaviorHints: { notWebReady: true },
   }));
 
-  console.log(
-    `[librefutbol] streams resueltos: ${streams.length} de ${candidates.length} candidato(s) en ${Date.now() - t0}ms`
-  );
-  // Resultado parcial (menos servidores que botones): se devuelve igual,
-  // pero no se cachea, para que el próximo pedido pueda completar.
-  streams.partial = streams.length < candidates.length;
+  console.log(`[librefutbol] streams resueltos: ${streams.length} de ${total} servidor(es) en ${Date.now() - t0}ms`);
+  // Parcial (menos servidores que botones): se devuelve igual pero no se
+  // cachea, para que el próximo pedido pueda completar.
+  streams.partial = streams.length < total;
   return streams;
 }
 
@@ -477,4 +455,4 @@ async function getStreams(id) {
   return p;
 }
 
-module.exports = { PREFIX, MAIN_URL, getCatalog, search, getMeta, getStreams };
+module.exports = { PREFIX, MAIN_URL, getCatalog, search, getMeta, getStreams, getStaticCandidates: getEmbedCandidates };

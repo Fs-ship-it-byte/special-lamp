@@ -243,38 +243,98 @@ async function getMeta(id) {
 // No hace falta ejecutar ese JS: el data-src ya trae la URL final en
 // texto plano dentro del HTML que ya tenemos.
 // ==========================================
-async function getEmbedCandidates(channelUrl) {
+function extractCandidatesFromHtml(html) {
+  const $ = cheerio.load(html);
+  const candidates = [];
+  const seen = new Set();
+
+  const push = (raw, label) => {
+    if (!raw) return;
+    const decoded = raw.replace(/\\\//g, '/').replace(/&amp;/g, '&').trim();
+    if (!decoded || /^(javascript:|#)/i.test(decoded)) return;
+    const url = absolutize(decoded);
+    if (seen.has(url)) return;
+    seen.add(url);
+    candidates.push({ url, name: (label || '').trim() || `Servidor ${candidates.length + 1}` });
+  };
+
+  // 1. Estructura conocida: <button class="option" data-src="...core.php?canal=...">
+  $('div.options-left button.option[data-src], button.option[data-src]').each((_, el) => {
+    const $el = $(el);
+    push($el.attr('data-src'), $el.text().trim() || $el.attr('data-label'));
+  });
+
+  // 2. Variantes: cualquier elemento "option"/"server" con data-src/url/link,
+  //    o <a class="option" href="...">. Algunos canales (ej. ESPN) pueden
+  //    usar otra etiqueta o atributo que el resto.
+  if (candidates.length === 0) {
+    $('[data-src],[data-url],[data-link],[data-iframe],[data-embed]').each((_, el) => {
+      const $el = $(el);
+      const raw =
+        $el.attr('data-src') || $el.attr('data-url') || $el.attr('data-link') ||
+        $el.attr('data-iframe') || $el.attr('data-embed');
+      if (el.tagName === 'iframe' || /core\.php|\.php|^https?:/i.test(raw || '')) {
+        push(raw, $el.text().trim() || $el.attr('data-label'));
+      }
+    });
+    $('a.option[href], a.server[href], .options-left a[href]').each((_, el) => {
+      const $el = $(el);
+      const href = $el.attr('href') || '';
+      if (/core\.php|player|embed/i.test(href)) push(href, $el.text().trim());
+    });
+  }
+
+  // 3. Cualquier mención a core.php?... en el HTML crudo (incluye scripts
+  //    con la lista de servidores como JSON/strings).
+  if (candidates.length === 0) {
+    const re = /["'(]((?:https?:)?\\?\/\\?\/[^"'\s<>)]*core\.php\?[^"'\s<>)]+|[^"'\s<>)]*core\.php\?[^"'\s<>)]+)/g;
+    let m;
+    while ((m = re.exec(html)) !== null) push(m[1], '');
+  }
+
+  // 4. Red de seguridad: iframe con src ya presente en el HTML estático.
+  if (candidates.length === 0) {
+    const staticSrc =
+      $('iframe#playerFrame').attr('src') || $('iframe#player-frame').attr('src') || '';
+    if (staticSrc) push(staticSrc, 'Opción 1');
+  }
+
+  return candidates;
+}
+
+function logNoCandidates(channelUrl, html) {
+  const count = (re) => (html.match(re) || []).length;
+  const title = ((html.match(/<title[^>]*>([^<]*)/i) || [])[1] || '').trim().slice(0, 80);
+  console.log(
+    `[librefutbol] diagnóstico ${channelUrl}: html=${html.length}ch title="${title}" ` +
+      `option=${count(/class=["'][^"']*option/gi)} data-src=${count(/data-src/gi)} ` +
+      `core.php=${count(/core\.php/gi)} iframe=${count(/<iframe/gi)} ` +
+      `playerFrame=${count(/playerFrame/gi)} cloudflare=${/just a moment|cf-chl|challenge-platform/i.test(html)}`
+  );
+}
+
+async function getEmbedCandidates(channelUrl, { deadline } = {}) {
   let html;
   try {
     html = await getHtml(channelUrl, { headers: { Referer: MAIN_URL } });
   } catch (e) {
     console.log(`[librefutbol] no se pudo cargar el canal ${channelUrl}: ${e.message}`);
-    return [];
+    html = null;
   }
 
-  const $ = cheerio.load(html);
-  const candidates = [];
-  const seen = new Set();
+  let candidates = html ? extractCandidatesFromHtml(html) : [];
 
-  $('div.options-left button.option[data-src], button.option[data-src]').each((_, el) => {
-    const $el = $(el);
-    const dataSrc = $el.attr('data-src') || '';
-    if (!dataSrc) return;
-    const url = absolutize(dataSrc);
-    if (seen.has(url)) return;
-    seen.add(url);
-    const label = $el.text().trim() || $el.attr('data-label') || '';
-    candidates.push({ url, name: label || `Servidor ${candidates.length + 1}` });
-  });
-
-  // Red de seguridad por si alguna página vieja/regional todavía sirve el
-  // iframe con src ya presente en el HTML estático (estructura del
-  // Kotlin original).
+  // Plan B: si el HTML estático no trae servidores (o ni cargó), se lee el
+  // DOM ya renderizado con Chromium.
   if (candidates.length === 0) {
-    const staticSrc =
-      $('iframe#playerFrame').attr('src') || $('iframe#player-frame').attr('src') || '';
-    if (staticSrc) {
-      candidates.push({ url: absolutize(staticSrc), name: 'Opción 1' });
+    if (html) logNoCandidates(channelUrl, html);
+    console.log('[librefutbol] sin candidatos en el HTML estático, pruebo con el navegador');
+    try {
+      const { collectCandidatesViaBrowser } = require('../extractors/browser');
+      const viaBrowser = await collectCandidatesViaBrowser(channelUrl, { deadline });
+      candidates = viaBrowser.map((c, i) => ({ url: c.url, name: c.name || `Servidor ${i + 1}` }));
+    } catch (e) {
+      console.log(`[librefutbol] falló el plan B de candidatos: ${e.message}`);
     }
   }
 
@@ -321,7 +381,8 @@ async function resolveEmbedToPlaylist(embedUrl, referer, depth = 0) {
 // ==========================================
 // Presupuesto total por pedido de streams. Se reparte entre cargar la
 // página y probar cada servidor; lo que no alcance se devuelve parcial.
-const STREAM_BUDGET_MS = parseInt(process.env.LIBREFUTBOL_BUDGET_MS || '20000', 10);
+const STREAM_BUDGET_MS = parseInt(process.env.LIBREFUTBOL_BUDGET_MS || '35000', 10);
+const PARALLEL_MS = parseInt(process.env.LIBREFUTBOL_PARALLEL_MS || '12000', 10);
 const PER_CANDIDATE_MS = parseInt(process.env.LIBREFUTBOL_PER_SERVER_MS || '10000', 10);
 
 // Cache corto de streams ya resueltos + dedupe de pedidos en vuelo.
@@ -335,10 +396,10 @@ const streamInFlight = new Map(); // id -> Promise
 const candidateCache = new Map(); // channelUrl -> { at, candidates }
 const CANDIDATE_TTL_MS = 10 * 60 * 1000;
 
-async function getEmbedCandidatesCached(channelUrl) {
+async function getEmbedCandidatesCached(channelUrl, deadline) {
   const hit = candidateCache.get(channelUrl);
   if (hit && Date.now() - hit.at < CANDIDATE_TTL_MS) return hit.candidates;
-  const candidates = await getEmbedCandidates(channelUrl);
+  const candidates = await getEmbedCandidates(channelUrl, { deadline });
   if (candidates.length > 0) candidateCache.set(channelUrl, { at: Date.now(), candidates });
   return candidates;
 }
@@ -347,7 +408,7 @@ async function resolveStreams(id) {
   const t0 = Date.now();
   const deadline = t0 + STREAM_BUDGET_MS;
   const channelUrl = fromId(id);
-  const candidates = await getEmbedCandidatesCached(channelUrl);
+  const candidates = await getEmbedCandidatesCached(channelUrl, deadline);
 
   if (candidates.length === 0) {
     console.log(`[librefutbol] sin candidatos de embed para ${channelUrl}`);
@@ -366,6 +427,7 @@ async function resolveStreams(id) {
     resolved = await resolvePlaylistsViaBrowser(channelUrl, candidates, {
       deadline,
       perCandidateMs: PER_CANDIDATE_MS,
+      parallelMs: PARALLEL_MS,
     });
     if (resolved.length > 0) break;
     console.log(`[librefutbol] intento ${attempt}: 0 servidores resueltos${attempt < 2 ? ', reintento' : ''}`);
@@ -382,6 +444,9 @@ async function resolveStreams(id) {
   console.log(
     `[librefutbol] streams resueltos: ${streams.length} de ${candidates.length} candidato(s) en ${Date.now() - t0}ms`
   );
+  // Resultado parcial (menos servidores que botones): se devuelve igual,
+  // pero no se cachea, para que el próximo pedido pueda completar.
+  streams.partial = streams.length < candidates.length;
   return streams;
 }
 
@@ -395,7 +460,7 @@ async function getStreams(id) {
 
   const p = resolveStreams(id)
     .then((streams) => {
-      if (streams.length > 0) {
+      if (streams.length > 0 && !streams.partial) {
         streamCache.set(id, { at: Date.now(), streams });
         if (streamCache.size > 200) {
           const cutoff = Date.now() - STREAM_CACHE_TTL_MS;

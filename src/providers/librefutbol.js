@@ -258,29 +258,31 @@ function extractCandidatesFromHtml(html) {
     candidates.push({ url, name: (label || '').trim() || `Servidor ${candidates.length + 1}` });
   };
 
-  // 1. Estructura conocida: <button class="option" data-src="...core.php?canal=...">
+  // 1. Estructuras conocidas. El sitio mezcla dos formatos según el canal:
+  //    a) <button class="option" data-src="...core.php?canal=...">
+  //    b) <a class="option" href="...envivo2/core.php?canal=..." target="player">
+  //       (ej. ESPN; el iframe es <iframe name="player"> sin id)
   $('div.options-left button.option[data-src], button.option[data-src]').each((_, el) => {
     const $el = $(el);
     push($el.attr('data-src'), $el.text().trim() || $el.attr('data-label'));
   });
+  $('a.option[href*="core.php"], .options-left a[href*="core.php"], a[target="player"][href*="core.php"]').each(
+    (_, el) => {
+      const $el = $(el);
+      push($el.attr('href'), $el.text().trim());
+    }
+  );
 
-  // 2. Variantes: cualquier elemento "option"/"server" con data-src/url/link,
-  //    o <a class="option" href="...">. Algunos canales (ej. ESPN) pueden
-  //    usar otra etiqueta o atributo que el resto.
+  // 2. Variantes con otros atributos -- SOLO si apuntan a un core.php (antes
+  //    esto aceptaba cualquier http(s) y podía agarrar imágenes lazy-load
+  //    con data-src, dando candidatos falsos).
   if (candidates.length === 0) {
     $('[data-src],[data-url],[data-link],[data-iframe],[data-embed]').each((_, el) => {
       const $el = $(el);
       const raw =
         $el.attr('data-src') || $el.attr('data-url') || $el.attr('data-link') ||
         $el.attr('data-iframe') || $el.attr('data-embed');
-      if (el.tagName === 'iframe' || /core\.php|\.php|^https?:/i.test(raw || '')) {
-        push(raw, $el.text().trim() || $el.attr('data-label'));
-      }
-    });
-    $('a.option[href], a.server[href], .options-left a[href]').each((_, el) => {
-      const $el = $(el);
-      const href = $el.attr('href') || '';
-      if (/core\.php|player|embed/i.test(href)) push(href, $el.text().trim());
+      if (/core\.php/i.test(raw || '')) push(raw, $el.text().trim() || $el.attr('data-label'));
     });
   }
 
@@ -295,7 +297,8 @@ function extractCandidatesFromHtml(html) {
   // 4. Red de seguridad: iframe con src ya presente en el HTML estático.
   if (candidates.length === 0) {
     const staticSrc =
-      $('iframe#playerFrame').attr('src') || $('iframe#player-frame').attr('src') || '';
+      $('iframe#playerFrame').attr('src') || $('iframe#player-frame').attr('src') ||
+      $('iframe[name="player"]').attr('src') || '';
     if (staticSrc) push(staticSrc, 'Opción 1');
   }
 
@@ -381,7 +384,7 @@ async function resolveEmbedToPlaylist(embedUrl, referer, depth = 0) {
 // ==========================================
 // Presupuesto total por pedido de streams. Se reparte entre cargar la
 // página y probar cada servidor; lo que no alcance se devuelve parcial.
-const STREAM_BUDGET_MS = parseInt(process.env.LIBREFUTBOL_BUDGET_MS || '35000', 10);
+const STREAM_BUDGET_MS = parseInt(process.env.LIBREFUTBOL_BUDGET_MS || '45000', 10);
 const PARALLEL_MS = parseInt(process.env.LIBREFUTBOL_PARALLEL_MS || '12000', 10);
 const PER_CANDIDATE_MS = parseInt(process.env.LIBREFUTBOL_PER_SERVER_MS || '10000', 10);
 

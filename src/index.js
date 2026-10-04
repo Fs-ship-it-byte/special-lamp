@@ -1,83 +1,32 @@
 const express = require('express');
 const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 const librefutbol = require('./providers/librefutbol');
-const bridge = require('./providers/librefutbol_bridge');
+const la18hdBridge = require('./providers/la18hd_bridge');
 const { handlePlaylistProxy, handleSegmentProxy, handleDirectProxy } = require('./hlsproxy');
 
-const PROVIDERS = { [librefutbol.PREFIX]: librefutbol };
-
-function providerForId(id) {
-  return PROVIDERS[id.split(':')[0]];
-}
-
+// Ya no tiene catálogo propio: solo responde "stream" para ids de
+// LA18HD (mismo idPrefix que ese addon), agregando fuentes de
+// librefutbol2.com como opciones extra junto a las que ya da LA18HD. Dos
+// addons instalados, el mismo id, Stremio junta los resultados de los dos
+// en la lista de streams -- no hay catálogo ni meta acá.
 const manifest = {
   id: 'community.storm.librefutbol',
-  version: '0.1.0',
-  name: 'LibreFutbol (canales en vivo)',
-  description: 'Canales de TV en vivo scrapeados de librefutbol2.com. Catálogo propio.',
+  version: '0.2.0',
+  name: 'LibreFutbol (fuentes extra para LA18HD)',
+  description:
+    'Sin catálogo propio: agrega fuentes de librefutbol2.com como opción extra a los canales del addon de LA18HD.',
   logo: 'https://i.ibb.co/q3v6R9qQ/librefutbol.jpg',
-  // "stream" lleva sus propios prefijos: los de este addon y los ids de la
-  // parrilla de redesigned-fortnight ("la18hd"), para sumar fuentes a esos
-  // canales (ver providers/librefutbol_bridge.js). "meta" y el catálogo
-  // siguen usando solo idPrefixes (librefutbol).
-  resources: [
-    'catalog',
-    'meta',
-    { name: 'stream', types: ['tv'], idPrefixes: [librefutbol.PREFIX, bridge.BRIDGE_PREFIX] },
-  ],
+  resources: [{ name: 'stream', types: ['tv'], idPrefixes: [la18hdBridge.LA18HD_PREFIX] }],
   types: ['tv'],
-  catalogs: [
-    {
-      type: 'tv',
-      id: 'canales',
-      name: 'LibreFutbol - Canales en vivo',
-      extra: [{ name: 'search' }],
-      posterShape: 'square',
-    },
-  ],
-  idPrefixes: [librefutbol.PREFIX],
+  catalogs: [],
+  idPrefixes: [la18hdBridge.LA18HD_PREFIX],
 };
-
-const CATALOG_TO_PROVIDER = { canales: librefutbol };
 
 const builder = new addonBuilder(manifest);
 
-builder.defineCatalogHandler(async ({ id, extra }) => {
-  try {
-    const provider = CATALOG_TO_PROVIDER[id];
-    if (!provider) return { metas: [] };
-    if (extra?.search) {
-      return { metas: await provider.search(extra.search) };
-    }
-    return { metas: await provider.getCatalog() };
-  } catch (err) {
-    console.error('catalog error', err);
-    return { metas: [] };
-  }
-});
-
-builder.defineMetaHandler(async ({ id }) => {
-  try {
-    const provider = providerForId(id);
-    if (!provider) return { meta: null };
-    const meta = await provider.getMeta(id);
-    return { meta };
-  } catch (err) {
-    console.error('meta error', err);
-    return { meta: null };
-  }
-});
-
 builder.defineStreamHandler(async ({ id }) => {
   try {
-    if (id.startsWith(`${bridge.BRIDGE_PREFIX}:`)) {
-      const bridged = await bridge.getStreamsForLa18hdId(id);
-      console.log(`total streams devueltos (puente): ${bridged.length}`);
-      return { streams: bridged };
-    }
-    const provider = providerForId(id);
-    if (!provider) return { streams: [] };
-    const streams = await provider.getStreams(id);
+    const streams = await la18hdBridge.getStreamsForLa18hdId(id);
     console.log(`total streams devueltos: ${streams.length}`);
     return { streams };
   } catch (err) {

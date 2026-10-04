@@ -158,14 +158,14 @@ function safeContinue(req) {
   }
 }
 
-// Página "cascarón": en vez de bajar la página real del canal (con toda su
-// publicidad, ~10s en un server chico), se intercepta SOLO esa navegación y
-// se responde un HTML vacío. La URL de la página sigue siendo la del canal,
-// así que el Referer/Origin que ven los iframes de servidor es el mismo que
-// si hubiera cargado la real -- pero sin pagar la carga. Si con el cascarón
-// no se resuelve ningún servidor, se reintenta con la página real.
-// LIBREFUTBOL_STUB_PARENT=0 lo desactiva.
-const STUB_PARENT = process.env.LIBREFUTBOL_STUB_PARENT !== '0';
+// Página "cascarón" (EXPERIMENTAL, apagada por defecto): responde un HTML
+// vacío en vez de la página real del canal. NO sirve en canales como ESPN:
+// la página real trae un script inline con un token (window['ZpQw9X...'])
+// que el iframe core.php -- mismo origen -- lee desde window.parent para
+// generar su firma. Sin ese token no sale ningún playlist.php. Se deja
+// disponible con LIBREFUTBOL_STUB_PARENT=1 por si algún día sirve.
+const STUB_PARENT = process.env.LIBREFUTBOL_STUB_PARENT === '1';
+const SETTLE_MS = parseInt(process.env.LIBREFUTBOL_SETTLE_MS || '5000', 10);
 const STUB_HTML = '<!doctype html><html><head><meta charset="utf-8"></head><body></body></html>';
 
 function normHref(u) {
@@ -288,9 +288,16 @@ async function resolvePlaylistsViaBrowser(
         )
         .catch(() => {});
 
-    const waitFor = async (entries, limitMs) => {
+    // Espera a que todos resuelvan, hasta limitMs. Si ya resolvió al menos
+    // uno, solo espera settleMs más por los demás (no vale la pena frenar
+    // todo el pedido por un servidor lento).
+    const waitFor = async (entries, limitMs, settleMs = 0) => {
       const t0 = Date.now();
       while (entries.some((e) => !e.result) && Date.now() - t0 < limitMs && !page.isClosed()) {
+        if (settleMs > 0) {
+          const firstAt = Math.min(...entries.filter((e) => e.result).map((e) => e.at), Infinity);
+          if (firstAt !== Infinity && Date.now() - firstAt >= settleMs) break;
+        }
         await sleep(120);
       }
     };
@@ -332,7 +339,7 @@ async function resolvePlaylistsViaBrowser(
       // se clona (mismos atributos: allow, sandbox, etc.).
       try {
         await page.evaluate((n) => {
-          const orig = document.querySelector('iframe#playerFrame, iframe#player-frame');
+          const orig = document.querySelector('iframe#playerFrame, iframe#player-frame, iframe[name="player"]');
           const parent = (orig && orig.parentNode) || document.body;
           for (let i = 0; i < n; i++) {
             const f = orig ? orig.cloneNode(false) : document.createElement('iframe');
@@ -362,7 +369,7 @@ async function resolvePlaylistsViaBrowser(
         const tPar = Date.now();
         state.active = entries;
         await Promise.all(entries.map((e) => setSrc(e.idx, e.candidate.url)));
-        await waitFor(entries, Math.min(parallelMs, deadline - Date.now() - 2500));
+        await waitFor(entries, Math.min(parallelMs, deadline - Date.now() - 2500), SETTLE_MS);
         state.active = [];
         console.log(
           `[librefutbol/browser] paralelo (${mode}): ${entries.filter((e) => e.result).length}/${entries.length} en ${Date.now() - tPar}ms`
@@ -485,7 +492,7 @@ async function collectCandidatesViaBrowser(channelUrl, { deadline } = {}) {
             el.getAttribute('data-link') ||
             el.getAttribute('data-iframe') ||
             el.getAttribute('data-embed');
-          if (el.tagName === 'IFRAME' || /core\.php|\.php|^https?:/i.test(raw || '')) {
+          if (/core\.php/i.test(raw || '')) {
             add(raw, el.textContent || el.getAttribute('data-label'));
           }
         });

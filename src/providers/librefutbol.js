@@ -455,4 +455,4 @@ async function getStreams(id) {
   return p;
 }
 
-module.exports = { PREFIX, MAIN_URL, getCatalog, search, getMeta, getStreams, getStaticCandidates: getEmbedCandidates };
+module.exports = { PREFIX, MAIN_URL, toId, getCatalog, search, getMeta, getStreams, getStaticCandidates: getEmbedCandidates };

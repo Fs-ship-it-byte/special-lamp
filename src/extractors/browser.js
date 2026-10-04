@@ -392,16 +392,34 @@ async function resolveChannelViaBrowser(channelUrl, fallback, { deadline, perCan
   if (first.result) results.push(first.result);
   if (first.skipped || list.length === 0) return { results, total: list.length };
 
-  // El resto de servidores: una página nueva cada uno (se encolan según el
-  // límite de concurrencia).
+  // El resto de servidores: una página nueva cada uno.
   const rest = list.slice(1);
-  const settled = await Promise.all(
-    rest.map((cand) => runChannelPage(channelUrl, { target: cand, deadline, perCandidateMs }))
-  );
-  for (const r of settled) if (r.result) results.push(r.result);
+  if (MAX_CONCURRENT_PAGES > 1) {
+    // Con RAM de sobra: en paralelo (el límite de páginas hace de semáforo).
+    const settled = await Promise.all(
+      rest.map((cand) => runChannelPage(channelUrl, { target: cand, deadline, perCandidateMs }))
+    );
+    for (const r of settled) if (r.result) results.push(r.result);
+  } else {
+    // De a una. Si los 2 primeros servidores fallan y no hay NINGÚN
+    // resultado, el canal casi seguro está caído: no se gastan más páginas
+    // (~15s cada una) en probar el resto.
+    let failures = first.result ? 0 : 1;
+    for (const cand of rest) {
+      if (results.length === 0 && failures >= 2) {
+        console.log('[librefutbol/browser] 2 servidores sin resultado y ninguno resuelto: canal caído, se corta');
+        return { results, total: list.length };
+      }
+      if (deadline - Date.now() < 6000) break;
+      const r = await runChannelPage(channelUrl, { target: cand, deadline, perCandidateMs });
+      if (r.result) results.push(r.result);
+      else failures++;
+    }
+  }
 
-  // Un reintento secuencial para los que fallaron, si queda tiempo.
-  const missing = list.filter((c) => !results.some((r) => r.candidate.url === c.url));
+  // Un reintento secuencial para los que fallaron, si queda tiempo (y si el
+  // canal dio algo: uno que no dio nada ya se descartó arriba).
+  const missing = results.length > 0 ? list.filter((c) => !results.some((r) => r.candidate.url === c.url)) : [];
   for (const cand of missing) {
     if (deadline - Date.now() < 12000) break;
     console.log(`[librefutbol/browser] reintentando "${cand.name}"`);

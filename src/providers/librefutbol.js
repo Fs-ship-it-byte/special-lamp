@@ -157,16 +157,45 @@ function extractChannelsFromHtml(html) {
   return channels;
 }
 
+let channelsInFlight = null;
+
+// Antes: `if (cachedChannels && ...)` -- un array vacío [] es "truthy" en JS,
+// así que si UN scrapeo salía vacío (sitio devolviendo algo raro un
+// momento) ese [] quedaba cacheado 10 minutos y TODOS los canales daban
+// "0 streams" hasta que venciera. Ahora:
+//  - un resultado vacío nunca se cachea;
+//  - si el scrapeo falla o sale vacío y hay una copia anterior, se sigue
+//    usando esa (aunque haya vencido) en vez de quedarse sin nada;
+//  - pedidos simultáneos comparten un solo scrapeo.
 async function getChannels() {
   const now = Date.now();
-  if (cachedChannels && now - cachedAt < CACHE_TTL_MS) return cachedChannels;
+  if (cachedChannels && cachedChannels.length > 0 && now - cachedAt < CACHE_TTL_MS) return cachedChannels;
+  if (channelsInFlight) return channelsInFlight;
 
-  const html = await getHtml(MAIN_URL);
-  const channels = extractChannelsFromHtml(html);
-  cachedChannels = channels;
-  cachedAt = now;
-  console.log(`[librefutbol] canales extraídos: ${channels.length}`);
-  return channels;
+  channelsInFlight = (async () => {
+    try {
+      const html = await getHtml(MAIN_URL);
+      const channels = extractChannelsFromHtml(html);
+      if (channels.length === 0) {
+        console.log('[librefutbol] el scrapeo de la home dio 0 canales (no se cachea)');
+        if (cachedChannels && cachedChannels.length > 0) return cachedChannels;
+        return channels;
+      }
+      cachedChannels = channels;
+      cachedAt = Date.now();
+      console.log(`[librefutbol] canales extraídos: ${channels.length}`);
+      return channels;
+    } catch (e) {
+      if (cachedChannels && cachedChannels.length > 0) {
+        console.log(`[librefutbol] no se pudo refrescar la home (${e.message}), uso la copia anterior`);
+        return cachedChannels;
+      }
+      throw e;
+    } finally {
+      channelsInFlight = null;
+    }
+  })();
+  return channelsInFlight;
 }
 
 function toMeta(channel) {
@@ -287,9 +316,38 @@ async function resolveEmbedToPlaylist(embedUrl, referer, depth = 0) {
   return null;
 }
 
-async function getStreams(id) {
-  const channelUrl = fromId(id);
+// ==========================================
+// STREAMS
+// ==========================================
+// Presupuesto total por pedido de streams. Se reparte entre cargar la
+// página y probar cada servidor; lo que no alcance se devuelve parcial.
+const STREAM_BUDGET_MS = parseInt(process.env.LIBREFUTBOL_BUDGET_MS || '20000', 10);
+const PER_CANDIDATE_MS = parseInt(process.env.LIBREFUTBOL_PER_SERVER_MS || '10000', 10);
+
+// Cache corto de streams ya resueltos + dedupe de pedidos en vuelo.
+// Stremio suele pedir los streams del mismo canal más de una vez seguidas
+// (abrir la ficha, darle play, reintentos); antes cada pedido abría su
+// propio Chromium para lo mismo. TTL corto porque el sig del CDN vence.
+const STREAM_CACHE_TTL_MS = parseInt(process.env.STREAM_CACHE_TTL_MS || '60000', 10);
+const streamCache = new Map(); // id -> { at, streams }
+const streamInFlight = new Map(); // id -> Promise
+
+const candidateCache = new Map(); // channelUrl -> { at, candidates }
+const CANDIDATE_TTL_MS = 10 * 60 * 1000;
+
+async function getEmbedCandidatesCached(channelUrl) {
+  const hit = candidateCache.get(channelUrl);
+  if (hit && Date.now() - hit.at < CANDIDATE_TTL_MS) return hit.candidates;
   const candidates = await getEmbedCandidates(channelUrl);
+  if (candidates.length > 0) candidateCache.set(channelUrl, { at: Date.now(), candidates });
+  return candidates;
+}
+
+async function resolveStreams(id) {
+  const t0 = Date.now();
+  const deadline = t0 + STREAM_BUDGET_MS;
+  const channelUrl = fromId(id);
+  const candidates = await getEmbedCandidatesCached(channelUrl);
 
   if (candidates.length === 0) {
     console.log(`[librefutbol] sin candidatos de embed para ${channelUrl}`);
@@ -297,33 +355,58 @@ async function getStreams(id) {
   }
 
   const { buildProxyPlaylistUrl } = require('../hlsproxy');
-  const { resolvePlaylistViaBrowser } = require('../extractors/browser');
+  const { resolvePlaylistsViaBrowser } = require('../extractors/browser');
 
-  // Confirmado: el sig que aparece en el HTML estático de core.php es un
-  // señuelo fijo (siempre el mismo string, nunca cambia entre sesiones) y
-  // además probamos que "verificarlo" con un GET normal antes de usarlo
-  // parecía funcionar pero luego el proxy real recibía 403 igual --
-  // fuerte indicio de que es de un solo uso y nuestra propia verificación
-  // lo quemaba. Vamos directo al navegador siempre, sin ese paso previo.
-  const streams = [];
-  for (const candidate of candidates) {
-    const viaBrowser = await resolvePlaylistViaBrowser(channelUrl, candidate.url);
-    if (!viaBrowser) {
-      console.log(`[librefutbol] no se pudo resolver ${candidate.name} con el navegador`);
-      continue;
-    }
-
-    streams.push({
-      name: 'LibreFutbol',
-      title: candidate.name,
-      url: buildProxyPlaylistUrl(viaBrowser.url, viaBrowser.headers),
-      type: 'hls',
-      behaviorHints: { notWebReady: true },
+  // Hasta 2 intentos: si el primero no devuelve NADA (Chromium recién
+  // caído, página que no cargó) y queda tiempo, se reintenta con página
+  // limpia. Si el primero devolvió algo, aunque sea parcial, no se repite.
+  let resolved = [];
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    if (deadline - Date.now() < 5000) break;
+    resolved = await resolvePlaylistsViaBrowser(channelUrl, candidates, {
+      deadline,
+      perCandidateMs: PER_CANDIDATE_MS,
     });
+    if (resolved.length > 0) break;
+    console.log(`[librefutbol] intento ${attempt}: 0 servidores resueltos${attempt < 2 ? ', reintento' : ''}`);
   }
 
-  console.log(`[librefutbol] streams resueltos: ${streams.length} de ${candidates.length} candidato(s)`);
+  const streams = resolved.map(({ candidate, url, headers }) => ({
+    name: 'LibreFutbol',
+    title: candidate.name,
+    url: buildProxyPlaylistUrl(url, headers),
+    type: 'hls',
+    behaviorHints: { notWebReady: true },
+  }));
+
+  console.log(
+    `[librefutbol] streams resueltos: ${streams.length} de ${candidates.length} candidato(s) en ${Date.now() - t0}ms`
+  );
   return streams;
+}
+
+async function getStreams(id) {
+  const cached = streamCache.get(id);
+  if (cached && Date.now() - cached.at < STREAM_CACHE_TTL_MS) {
+    console.log(`[librefutbol] streams desde cache (${cached.streams.length})`);
+    return cached.streams;
+  }
+  if (streamInFlight.has(id)) return streamInFlight.get(id);
+
+  const p = resolveStreams(id)
+    .then((streams) => {
+      if (streams.length > 0) {
+        streamCache.set(id, { at: Date.now(), streams });
+        if (streamCache.size > 200) {
+          const cutoff = Date.now() - STREAM_CACHE_TTL_MS;
+          for (const [k, v] of streamCache) if (v.at < cutoff) streamCache.delete(k);
+        }
+      }
+      return streams;
+    })
+    .finally(() => streamInFlight.delete(id));
+  streamInFlight.set(id, p);
+  return p;
 }
 
 module.exports = { PREFIX, MAIN_URL, getCatalog, search, getMeta, getStreams };

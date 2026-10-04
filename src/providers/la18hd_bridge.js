@@ -18,7 +18,9 @@ function normalize(name) {
     .toUpperCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^A-Z0-9]/g, '');
+    .replace(/[^A-Z0-9]/g, '')
+    // "ESPN HD" / "ESPN en vivo" en un sitio vs "ESPN" en el otro: mismo canal.
+    .replace(/(ENVIVO|HD)$/, '');
 }
 
 // Mismo canal, nombre distinto entre los dos sitios. Agregar más pares

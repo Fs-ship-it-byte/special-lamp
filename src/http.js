@@ -2,40 +2,50 @@ const fetch = require('node-fetch');
 const { CookieJar } = require('tough-cookie');
 const fetchCookieFactory = require('fetch-cookie');
 
-// Jar compartido: el sitio fachada (librefutbol2.com) no lo necesita para
-// nada en particular hasta donde sabemos, pero lo dejamos por las dudas
-// (mismo patrón que el resto de los providers de este estilo) y porque no
-// cuesta nada tenerlo.
 const jar = new CookieJar();
 const fetchWithCookies = fetchCookieFactory(fetch, jar);
 
+// OJO: antes acá se mandaba también 'X-Requested-With: XMLHttpRequest' en
+// TODOS los pedidos. Eso le dice al sitio "soy una llamada AJAX", y hay
+// sitios que contestan otra cosa (HTML parcial, bloqueo, challenge) --
+// el scrapeo de la home devolvía 0 canales y ese resultado quedaba
+// cacheado. redesigned-fortnight no lo manda y anda bien, así que se saca.
 const DEFAULT_HEADERS = {
   'User-Agent':
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
   Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
-  'X-Requested-With': 'XMLHttpRequest',
 };
 
-// El CDN real de video vive en un dominio totalmente distinto al del sitio
-// fachada (ver comentario en el provider), y solo acepta Origin/Referer de
-// su propio dominio embed -- portado 1:1 del interceptor OkHttp del
-// TvLibrefutbolProvider original.
-const VIDEO_CDN_HOST_MATCHES = ['ksdjugfssddeports.com', 'playlist.php', '.ts', ':9092'];
+// El CDN real de video vive en un dominio distinto al del sitio fachada y
+// solo acepta Origin/Referer de su propio dominio embed.
+// (Antes también matcheaba '.ts' y ':9092' como substring suelto, lo que
+// podía pegarle esos headers a URLs que no tenían nada que ver.)
+const VIDEO_CDN_HOST_MATCHES = ['ksdjugfssddeports.com', 'playlist.php'];
 const VIDEO_CDN_HEADERS = {
   Origin: 'https://embed.ksdjugfssddeports.com',
   Referer: 'https://embed.ksdjugfssddeports.com/',
 };
 
+const FETCH_TIMEOUT_MS = parseInt(process.env.HTTP_TIMEOUT_MS || '10000', 10);
+
 function isVideoCdnUrl(url) {
   return VIDEO_CDN_HOST_MATCHES.some((needle) => url.includes(needle));
 }
 
-async function getHtml(url, opts = {}) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function getHtmlOnce(url, opts) {
+  // Bug anterior: `{ headers: {...todos}, ...opts }` hacía que, si opts
+  // traía "headers" (ej. solo Referer), REEMPLAZARA a todos los headers
+  // -> el pedido salía sin User-Agent de navegador. Ahora se separan y se
+  // mezclan bien.
+  const { headers: optHeaders, ...rest } = opts;
   const extraHeaders = isVideoCdnUrl(url) ? VIDEO_CDN_HEADERS : {};
   const res = await fetchWithCookies(url, {
-    headers: { ...DEFAULT_HEADERS, ...extraHeaders, ...(opts.headers || {}) },
-    ...opts,
+    timeout: FETCH_TIMEOUT_MS,
+    ...rest,
+    headers: { ...DEFAULT_HEADERS, ...extraHeaders, ...(optHeaders || {}) },
   });
   if (!res.ok) {
     let snippet = '';
@@ -49,6 +59,20 @@ async function getHtml(url, opts = {}) {
     throw err;
   }
   return res.text();
+}
+
+// Un reintento ante fallos transitorios (timeout, reset de conexión, 5xx,
+// 429). Los 4xx "de verdad" (403/404) no se reintentan.
+async function getHtml(url, opts = {}) {
+  try {
+    return await getHtmlOnce(url, opts);
+  } catch (e) {
+    const transient = !e.status || e.status >= 500 || e.status === 429;
+    if (!transient) throw e;
+    console.log(`[http] fallo transitorio en ${url} (${e.message.slice(0, 120)}), reintentando...`);
+    await sleep(400);
+    return getHtmlOnce(url, opts);
+  }
 }
 
 module.exports = { getHtml, DEFAULT_HEADERS, VIDEO_CDN_HEADERS, isVideoCdnUrl, fetchWithCookies, jar };

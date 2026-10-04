@@ -22,21 +22,51 @@ const manifest = {
   idPrefixes: [la18hdBridge.LA18HD_PREFIX],
 };
 
+// En Node 20 una promesa rechazada sin catch MATA el proceso (Render lo
+// reinicia y el pedido en curso devuelve 0 streams). Puppeteer genera
+// rechazos sueltos cuando una página se cierra con pedidos en vuelo, así
+// que se loguean en vez de dejar caer el addon.
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason && reason.message ? reason.message : reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err && err.stack ? err.stack : err);
+});
+
 const builder = new addonBuilder(manifest);
 
+const HANDLER_TIMEOUT_MS = parseInt(process.env.STREAM_HANDLER_TIMEOUT_MS || '25000', 10);
+function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 builder.defineStreamHandler(async ({ id }) => {
+  const t0 = Date.now();
   try {
-    const streams = await la18hdBridge.getStreamsForLa18hdId(id);
-    console.log(`total streams devueltos: ${streams.length}`);
-    return { streams };
+    const streams = await withTimeout(la18hdBridge.getStreamsForLa18hdId(id), HANDLER_TIMEOUT_MS);
+    if (streams === null) {
+      console.log(`stream handler: timeout a los ${HANDLER_TIMEOUT_MS}ms para ${id.slice(0, 40)}...`);
+      return { streams: [], cacheMaxAge: 0 };
+    }
+    console.log(`total streams devueltos: ${streams.length} (${Date.now() - t0}ms)`);
+    // Un resultado vacío no debe quedar cacheado del lado de Stremio.
+    return streams.length > 0 ? { streams } : { streams, cacheMaxAge: 0 };
   } catch (err) {
     console.error('stream error', err);
-    return { streams: [] };
+    return { streams: [], cacheMaxAge: 0 };
   }
 });
 
 const app = express();
 app.use(getRouter(builder.getInterface()));
+
+// Health check liviano (para un ping de keep-alive externo, ej. UptimeRobot,
+// y que el servicio free no se duerma entre usos).
+app.get('/health', (req, res) => res.send('ok'));
 
 app.get('/hlsproxy/playlist/:token/:file', handlePlaylistProxy);
 app.get('/hlsproxy/segment/:token/:file', handleSegmentProxy);
@@ -169,5 +199,10 @@ app.listen(PORT, () => {
   console.log(`Addon corriendo en ${base}/manifest.json`);
   if (!process.env.PUBLIC_URL) {
     console.warn('AVISO: falta PUBLIC_URL. En Railway hay que configurarla.');
+  }
+  // Chromium se lanza ya, en segundo plano, para que el primer pedido real
+  // no pague el arranque en frío. WARM_BROWSER=0 lo desactiva.
+  if (process.env.WARM_BROWSER !== '0') {
+    require('./extractors/browser').warmBrowser();
   }
 });

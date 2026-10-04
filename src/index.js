@@ -35,7 +35,7 @@ process.on('uncaughtException', (err) => {
 
 const builder = new addonBuilder(manifest);
 
-const HANDLER_TIMEOUT_MS = parseInt(process.env.STREAM_HANDLER_TIMEOUT_MS || '50000', 10);
+const HANDLER_TIMEOUT_MS = parseInt(process.env.STREAM_HANDLER_TIMEOUT_MS || '60000', 10);
 function withTimeout(promise, ms) {
   let timer;
   const timeout = new Promise((resolve) => {
@@ -118,6 +118,24 @@ app.get('/debug/page', async (req, res) => {
 // independiente de toda la complejidad del sitio (mismo chequeo que
 // usaste en el addon de PelisPedia).
 // ==========================================
+// DEBUG: compara los servidores que ve el fetch plano (HTML estático) contra
+// los que ve Chromium (DOM real). El sitio sirve variantes distintas.
+//   /debug/candidates?url=https://www.librefutbol2.com/espn-en-vivo-online.php
+app.get('/debug/candidates', async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).send('Falta ?url=https://www.librefutbol2.com/algun-canal.php');
+  res.set('Content-Type', 'text/plain; charset=utf-8');
+  try {
+    const staticList = await librefutbol.getStaticCandidates(url);
+    const { collectCandidatesViaBrowser } = require('./extractors/browser');
+    const domList = await collectCandidatesViaBrowser(url, { deadline: Date.now() + 30000 });
+    const fmt = (l) => l.map((c) => `  - ${c.name}: ${c.url}`).join('\n') || '  (ninguno)';
+    res.send(`URL: ${url}\n\nHTML estático (fetch):\n${fmt(staticList)}\n\nDOM de Chromium:\n${fmt(domList)}`);
+  } catch (e) {
+    res.status(500).send(`Error: ${e.message}`);
+  }
+});
+
 app.get('/debug/browsercheck', async (req, res) => {
   res.set('Content-Type', 'text/plain; charset=utf-8');
   let puppeteer;
